@@ -91,6 +91,12 @@ Panel `ramka.local` pozwala:
 - usunąć wybrany plik;
 - skasować zapisane dane Wi-Fi i ponownie uruchomić konfigurację.
 
+Program GIF 160×128 korzysta dodatkowo z API ramki:
+
+- `POST /upload` wgrywa plik i zastępuje istniejący plik o tej samej nazwie;
+- `GET /api/files` zwraca listę GIF-ów i ich rozmiary w formacie JSON;
+- `GET /file?name=obraz.gif` pobiera wskazany GIF z karty SD.
+
 Nazwy plików mogą zawierać litery ASCII, cyfry, kropkę, myślnik i podkreślenie.
 Pobierany plik może mieć maksymalnie 6 MB, a sam obraz nie może przekraczać
 160×128 pikseli. Panel nie ma logowania, dlatego powinien działać wyłącznie w

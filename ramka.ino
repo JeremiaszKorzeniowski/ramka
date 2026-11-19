@@ -209,6 +209,14 @@ String htmlEscape(String value) {
   return value;
 }
 
+String jsonEscape(String value) {
+  value.replace("\\", "\\\\");
+  value.replace("\"", "\\\"");
+  value.replace("\r", "\\r");
+  value.replace("\n", "\\n");
+  return value;
+}
+
 void scanGifFiles() {
   gifCount = 0;
   File root = SD.open("/");
@@ -470,8 +478,46 @@ void handleDownload() {
   server.send(303);
 }
 
+void handleApiFiles() {
+  String json = "{\"files\":[";
+  for (uint8_t i = 0; i < gifCount; ++i) {
+    if (i > 0) json += ',';
+    File file = SD.open(gifFiles[i], FILE_READ);
+    const uint32_t size = file ? file.size() : 0;
+    file.close();
+    json += "{\"name\":\"";
+    json += jsonEscape(gifFiles[i].substring(1));
+    json += "\",\"size\":";
+    json += String(size);
+    json += '}';
+    yield();
+  }
+  json += "]}";
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json; charset=utf-8", json);
+}
+
+void handleFileDownload() {
+  const String path = safeGifPath(server.arg("name"));
+  if (!path.length()) {
+    server.send(400, "text/plain; charset=utf-8", "Niepoprawna nazwa pliku");
+    return;
+  }
+  File file = SD.open(path, FILE_READ);
+  if (!file) {
+    server.send(404, "text/plain; charset=utf-8", "Nie znaleziono pliku");
+    return;
+  }
+  server.sendHeader("Content-Disposition", "attachment; filename=\"" + path.substring(1) + "\"");
+  server.sendHeader("Cache-Control", "no-store");
+  server.streamFile(file, "image/gif");
+  file.close();
+}
+
 void startWebServer() {
   server.on("/", HTTP_GET, handleRoot);
+  server.on("/api/files", HTTP_GET, handleApiFiles);
+  server.on("/file", HTTP_GET, handleFileDownload);
   server.on("/upload", HTTP_POST, finishUpload, handleUploadData);
   server.on("/delete", HTTP_POST, []() {
     const String path = safeGifPath(server.arg("name"));
