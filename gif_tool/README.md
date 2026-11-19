@@ -6,14 +6,25 @@ Można zaznaczyć lub przeciągnąć wiele plików naraz; wszystkie zostaną
 przetworzone tym samym stylem i ustawieniami, a błąd jednego pliku nie zatrzyma
 pozostałych.
 
-- **Skaluj do GIF** – centralnie kadruje do proporcji 5:4 i zapisuje GIF 160×128.
+- **Skaluj do GIF** – kadruje zaznaczony obszar do proporcji 5:4 i zapisuje
+  GIF 160×128.
+- Podgląd pokazuje żółtą ramkę kadru 5:4 z czerwonymi uchwytami.
+  Ramkę można przesuwać myszą, a jej rozmiar zmieniać kółkiem lub
+  przyciskami **−** i **+**. Oddalenie może wyjść poza zdjęcie; brakujący
+  obszar zostanie wypełniony czarnym tłem. **Całość** od razu pokazuje cały
+  obraz w formacie 5:4, a **Reset** przywraca kadr domyślny.
+- Przy wielu plikach strzałki pod podglądem pozwalają ustawić osobny kadr
+  dla każdego obrazu. W animowanym GIF-ie wybrany kadr jest stosowany do
+  wszystkich klatek.
 - **Zrób Pixel Art** – dodatkowo redukuje rozdzielczość i kolory zgodnie z
   wybranym stylem oraz paletą.
 - **Manga czarno-biała** – zamienia zdjęcie lub animację w czarno-biały rysunek z
   wyraźnym konturem i rastrem drukarskim, charakterystycznym dla mangi.
-- **Kolorowe Anime** – upraszcza kolory do płaskich, nasyconych tonów i dodaje
-  ciemny kontur w stylu animacji cel-shading.
-- Animowane GIF-y zachowują liczbę klatek, czasy klatek i ustawienie pętli.
+- **Anime malarskie** – nadaje obrazowi cieplejszą, pastelową paletę, wygładza
+  fotograficzny szum i dodaje delikatne brązowo-grafitowe linie tylko na mocnych
+  krawędziach. Efekt nawiązuje do klasycznej, ręcznie malowanej animacji.
+- Animowane GIF-y zachowują liczbę klatek i czasy klatek oraz zawsze otrzymują
+  nieskończoną pętlę.
 - Orientacja EXIF ze zdjęć wykonanych telefonem lub aparatem jest automatycznie
   wykrywana i korygowana przed kadrowaniem.
 - GIF-y 160×128 trafiają do podfolderu `wyniki`. Pełnowymiarowe wersje
@@ -25,9 +36,13 @@ pozostałych.
   razie potrzeby stopniowo ogranicza kolory oraz liczbę klatek. Łączny czas
   animacji pozostaje bez zmian.
 - Po konwersji program pokazuje rzeczywisty rozmiar zapisanego GIF-a.
+- Pole **Folder na karcie** zapisuje wyniki w podfolderze o bezpiecznej nazwie.
+- Pole **Tagi** przyjmuje słowa rozdzielone przecinkami lub spacjami. Tagi są
+  normalizowane i dopisywane do nazwy po `__`, np.
+  `kicia-standard-160x128__kot_smieszne.gif`.
 - Każdy gotowy GIF jest również kopiowany do `wyslij do ramki`. Przycisk
-  **Wyślij do ramki** przesyła wszystkie GIF-y z tego folderu na kartę SD;
-  pliki o tej samej nazwie są zastępowane.
+  **Wyślij do ramki** przesyła wszystkie GIF-y wraz ze strukturą jednego poziomu
+  folderów na kartę SD; pliki o tej samej nazwie są zastępowane.
 - Przycisk **Pobierz z ramki** zapisuje wszystkie GIF-y z karty w folderze
   `obrazy w ramce`, również zastępując lokalne pliki o tych samych nazwach.
 - Domyślny adres to `http://ramka.local`; można go zmienić w oknie programu.

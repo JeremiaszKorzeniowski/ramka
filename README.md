@@ -47,9 +47,9 @@ Dla modułu z opisami `CLK`, `DT`, `SW`, `+` i `GND`:
 | + / VCC | 3V3 | nigdy 5 V |
 | GND | GND | wspólna masa |
 
-Obrót wybiera poprzednią lub następną animację. Naciśnięcie przełącza automatyczną
-zmianę animacji co 12 sekund. Jeśli kierunek obrotu jest odwrotny, zamień przewody
-`CLK` i `DT`.
+Obrót wybiera poprzednią lub następną animację. Krótkie naciśnięcie przełącza
+tryb automatyczny i stały. Przytrzymanie przez 3 sekundy otwiera menu biblioteki,
+w którym można wybrać źródło, tag, kolejność oraz konkretny plik.
 
 `D3` jest pinem startowym ESP8266. Nie trzymaj wciśniętego enkodera podczas
 włączania zasilania ani resetowania płytki, bo ESP8266 może wejść w tryb programowania.
@@ -85,7 +85,7 @@ próbę połączenia.
 
 Panel `ramka.local` pozwala:
 
-- zobaczyć wszystkie pliki `.gif` w katalogu głównym karty;
+- zobaczyć wszystkie pliki `.gif` w katalogu głównym i podfolderach;
 - wgrać GIF z komputera lub telefonu;
 - pobrać GIF z bezpośredniego adresu `http://` albo `https://`;
 - usunąć wybrany plik;
@@ -94,6 +94,7 @@ Panel `ramka.local` pozwala:
 Program GIF 160×128 korzysta dodatkowo z API ramki:
 
 - `POST /upload` wgrywa plik i zastępuje istniejący plik o tej samej nazwie;
+  parametr `folder` pozwala wysłać go do jednego poziomu podfolderu;
 - `GET /api/files` zwraca listę GIF-ów i ich rozmiary w formacie JSON;
 - `GET /file?name=obraz.gif` pobiera wskazany GIF z karty SD.
 
@@ -112,7 +113,15 @@ zaufanej sieci domowej.
 
 ## Pliki
 
-Program automatycznie wykrywa do 32 plików `.gif` w katalogu głównym karty i
-sortuje je alfabetycznie. Użyte obrazy są plikami dostarczonymi przez użytkownika;
+Program automatycznie wykrywa do 64 plików `.gif` w katalogu głównym oraz w jednym
+poziomie podfolderów. Obsługuje do 12 folderów i 24 tagów. Źródło `Wszystkie`
+łączy całą bibliotekę, a `Główny` oznacza pliki leżące bezpośrednio na karcie.
+
+Tagi zapisuje się po podwójnym podkreśleniu i rozdziela pojedynczym `_`, np.
+`kicia__kot_smieszne_pixel.gif`. Na ekranie wyświetlana jest nazwa `kicia`, a tagi
+są dostępne jako filtry. Kolejność może być alfabetyczna albo losowa bez powtórek
+do czasu przejścia przez całą aktywną listę.
+
+Użyte obrazy są plikami dostarczonymi przez użytkownika;
 przed publicznym udostępnieniem projektu warto sprawdzić ich źródła i licencje.
 

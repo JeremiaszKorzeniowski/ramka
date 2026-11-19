@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import unicodedata
+import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Mapping
 
 from PIL import Image, ImageChops, ImageEnhance, ImageFilter, ImageOps
 
@@ -132,7 +133,28 @@ def _flatten_alpha(frame: Image.Image) -> Image.Image:
     return background.convert("RGB")
 
 
-def _fit(frame: Image.Image, size: tuple[int, int], method: int) -> Image.Image:
+CropBox = tuple[float, float, float, float]
+
+
+def _fit(
+    frame: Image.Image,
+    size: tuple[int, int],
+    method: int,
+    crop_box: CropBox | None = None,
+) -> Image.Image:
+    if crop_box is not None:
+        x0, y0, x1, y1 = crop_box
+        width, height = frame.size
+        left = round(x0 * width)
+        top = round(y0 * height)
+        right = max(left + 1, round(x1 * width))
+        bottom = max(top + 1, round(y1 * height))
+        crop_width, crop_height = right - left, bottom - top
+        # Kadr może wyjść poza zdjęcie. Dzięki temu da się pokazać
+        # cały pionowy obraz, a wolne miejsce po bokach staje się czarnym tłem.
+        cropped = Image.new("RGB", (crop_width, crop_height), "black")
+        cropped.paste(frame.convert("RGB"), (-left, -top))
+        frame = cropped
     return ImageOps.fit(frame, size, method=method, centering=(0.5, 0.5))
 
 
@@ -140,7 +162,9 @@ def _read_frames(source: Path) -> tuple[list[Image.Image], list[int], int]:
     frames: list[Image.Image] = []
     durations: list[int] = []
     with Image.open(source) as image:
-        loop = int(image.info.get("loop", 0))
+        # GIF-y przeznaczone do ramki mają odtwarzać się bez końca,
+        # niezależnie od ustawienia pętli w pliku źródłowym.
+        loop = 0
         default_duration = max(20, int(image.info.get("duration", 100)))
         for index in range(getattr(image, "n_frames", 1)):
             image.seek(index)
@@ -168,6 +192,20 @@ def _slug(value: str) -> str:
     return "-".join(part for part in normalized.lower().replace("_", "-").split() if part)
 
 
+def metadata_token(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^a-z0-9-]+", "-", normalized.lower()).strip("-")
+
+
+def normalize_tags(values: Iterable[str]) -> tuple[str, ...]:
+    result: list[str] = []
+    for value in values:
+        token = metadata_token(value)
+        if token and token not in result:
+            result.append(token)
+    return tuple(result)
+
+
 def _safe_output_path(output_dir: Path, stem: str, tag: str, extension: str) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     candidate = output_dir / f"{stem}-{tag}{extension}"
@@ -176,6 +214,26 @@ def _safe_output_path(output_dir: Path, stem: str, tag: str, extension: str) -> 
         candidate = output_dir / f"{stem}-{tag}-{counter}{extension}"
         counter += 1
     return candidate
+
+
+def _safe_tagged_output_path(
+    output_dir: Path,
+    stem: str,
+    descriptor: str,
+    extension: str,
+    tags: Iterable[str],
+) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    safe_stem = metadata_token(stem) or "obraz"
+    safe_tags = normalize_tags(tags)
+    tag_suffix = f"__{'_'.join(safe_tags)}" if safe_tags else ""
+    counter = 1
+    while True:
+        duplicate = "" if counter == 1 else f"-{counter}"
+        candidate = output_dir / f"{safe_stem}-{descriptor}{duplicate}{tag_suffix}{extension}"
+        if not candidate.exists():
+            return candidate
+        counter += 1
 
 
 def _save_gif(
@@ -407,22 +465,44 @@ def _manga_finalizer(frame: Image.Image) -> Image.Image:
 def _anime_transform(
     frame: Image.Image, size: tuple[int, int], _options: ConversionOptions
 ) -> Image.Image:
-    color = ImageEnhance.Color(frame.convert("RGB")).enhance(1.35)
-    color = ImageEnhance.Contrast(color).enhance(1.18)
-    color = ImageOps.posterize(color, 4)
+    source = frame.convert("RGB")
+    visual_scale = max(1, min(4, round(size[0] / TARGET_SIZE[0])))
+
+    # Miękkie, malarskie plamy koloru zamiast twardej posteryzacji.
+    # Median zachowuje granice obiektów, a lekki blur usuwa fotograficzny szum.
+    smooth = source.filter(ImageFilter.MedianFilter(3))
+    painted = smooth.filter(ImageFilter.GaussianBlur(0.38 * visual_scale))
+    color = Image.blend(smooth, painted, 0.42)
+
+    # Pastelowa krzywa z podniesionymi cieniami i ciepłymi światłami.
+    red, green, blue = color.split()
+    red = red.point(lambda value: min(255, round(9 + 246 * (value / 255) ** 0.91)))
+    green = green.point(lambda value: min(255, round(7 + 248 * (value / 255) ** 0.96)))
+    blue = blue.point(lambda value: min(255, round(5 + 245 * (value / 255) ** 1.02)))
+    color = Image.merge("RGB", (red, green, blue))
+    color = ImageEnhance.Color(color).enhance(1.16)
+    color = ImageEnhance.Contrast(color).enhance(0.94)
+    color = ImageEnhance.Brightness(color).enhance(1.025)
+    color = Image.blend(color, Image.new("RGB", color.size, (255, 226, 184)), 0.035)
+
+    # Więcej odcieni i mniej plastikowych, płaskich powierzchni niż wcześniej.
     color = color.quantize(
-        colors=48,
+        colors=96,
         method=Image.Quantize.MEDIANCUT,
         dither=Image.Dither.NONE,
     ).convert("RGB")
 
-    visual_scale = max(1, min(4, round(size[0] / TARGET_SIZE[0])))
-    gray = ImageOps.grayscale(frame).filter(ImageFilter.GaussianBlur(0.65 * visual_scale))
+    # Selektywne, brązowo-grafitowe linie tylko na mocnych krawędziach.
+    # Maska jest półprzezroczysta, więc nie tworzy czarnej obwódki wokół wszystkiego.
+    gray = ImageOps.grayscale(source).filter(ImageFilter.GaussianBlur(0.9 * visual_scale))
     edges = ImageOps.autocontrast(gray.filter(ImageFilter.FIND_EDGES))
-    ink_mask = edges.point(lambda value: 255 if value >= 58 else 0)
+    ink_mask = edges.point(
+        lambda value: 0 if value < 82 else min(132, round((value - 82) * 1.35))
+    )
     if visual_scale > 1:
-        ink_mask = ink_mask.filter(ImageFilter.MaxFilter(visual_scale * 2 + 1))
-    color.paste((24, 20, 32), mask=ink_mask)
+        ink_mask = ink_mask.filter(ImageFilter.MaxFilter(visual_scale * 2 - 1))
+    ink_mask = ink_mask.filter(ImageFilter.GaussianBlur(0.35 * visual_scale))
+    color.paste((48, 40, 43), mask=ink_mask)
     return color
 
 
@@ -464,7 +544,7 @@ CONVERSION_STYLES: dict[str, ConversionStyle] = {
     ),
     "anime": ConversionStyle(
         key="anime",
-        button_label="KOLOROWE ANIME",
+        button_label="ANIME MALARSKIE",
         filename_tag="anime",
         color="#f97316",
         transformer=_anime_transform,
@@ -487,6 +567,9 @@ def convert_style(
     pixel_style_name: str | None = None,
     palette_name: str | None = None,
     compression_name: str | None = None,
+    tags: Iterable[str] = (),
+    output_subfolder: str | None = None,
+    crop_box: CropBox | None = None,
 ) -> ConversionResult:
     style = CONVERSION_STYLES[style_key]
     options = ConversionOptions(
@@ -497,11 +580,14 @@ def convert_style(
     frames, durations, loop = _read_frames(source)
     tag = _style_tag(style, options)
     results_dir = application_dir / OUTPUT_FOLDER_NAME
-    output = _safe_output_path(results_dir, source.stem, f"{tag}-160x128", ".gif")
+    safe_folder = metadata_token(output_subfolder or "")
+    if safe_folder:
+        results_dir /= safe_folder
+    output = _safe_tagged_output_path(results_dir, source.stem, f"{tag}-160x128", ".gif", tags)
     final_frames = [
         style.finalizer(
             style.transformer(
-                _fit(frame, TARGET_SIZE, Image.Resampling.LANCZOS),
+                _fit(frame, TARGET_SIZE, Image.Resampling.LANCZOS, crop_box),
                 TARGET_SIZE,
                 options,
             )
@@ -521,7 +607,7 @@ def convert_style(
         large_size = _large_canvas_size(frames[0])
         large_frames = [
             style.transformer(
-                _fit(frame, large_size, Image.Resampling.LANCZOS),
+                _fit(frame, large_size, Image.Resampling.LANCZOS, crop_box),
                 large_size,
                 options,
             )
@@ -541,6 +627,9 @@ def convert_many(
     pixel_style_name: str | None = None,
     palette_name: str | None = None,
     compression_name: str | None = None,
+    tags: Iterable[str] = (),
+    output_subfolder: str | None = None,
+    crop_boxes: Mapping[Path, CropBox] | None = None,
 ) -> BatchConversionResult:
     results: list[ConversionResult] = []
     failures: list[ConversionFailure] = []
@@ -554,6 +643,9 @@ def convert_many(
                     pixel_style_name,
                     palette_name,
                     compression_name,
+                    tags,
+                    output_subfolder,
+                    None if crop_boxes is None else crop_boxes.get(source),
                 )
             )
         except Exception as error:

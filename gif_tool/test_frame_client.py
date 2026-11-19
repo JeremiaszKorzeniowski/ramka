@@ -17,10 +17,14 @@ class FrameHandler(BaseHTTPRequestHandler):
         pass
 
     def do_POST(self) -> None:
+        parsed = urlparse(self.path)
         body = self.rfile.read(int(self.headers["Content-Length"]))
         match = re.search(br'filename="([^"]+)"', body)
         assert match is not None
         name = match.group(1).decode("utf-8")
+        folder = parse_qs(parsed.query).get("folder", [""])[0]
+        if folder:
+            name = f"{folder}/{name}"
         content = body.split(b"\r\n\r\n", 1)[1].rsplit(b"\r\n--", 1)[0]
         self.files[name] = content
         self.send_response(200)
@@ -71,16 +75,22 @@ class FrameClientTests(TestCase):
             inbound.mkdir()
             (outbound / "existing.gif").write_bytes(b"new-content")
             (outbound / "second.gif").write_bytes(b"second")
+            (outbound / "gify").mkdir()
+            (outbound / "gify" / "nested.gif").write_bytes(b"nested")
             (outbound / "ignored.png").write_bytes(b"ignored")
             (inbound / "existing.gif").write_bytes(b"stale")
 
             uploaded = self.client.upload_all(outbound)
             downloaded = self.client.download_all(inbound)
 
-            self.assertEqual([path.name for path in uploaded], ["existing.gif", "second.gif"])
-            self.assertEqual(len(downloaded), 2)
+            self.assertEqual(
+                [path.relative_to(outbound).as_posix() for path in uploaded],
+                ["existing.gif", "gify/nested.gif", "second.gif"],
+            )
+            self.assertEqual(len(downloaded), 3)
             self.assertEqual((inbound / "existing.gif").read_bytes(), b"new-content")
             self.assertEqual((inbound / "second.gif").read_bytes(), b"second")
+            self.assertEqual((inbound / "gify" / "nested.gif").read_bytes(), b"nested")
 
 
 if __name__ == "__main__":

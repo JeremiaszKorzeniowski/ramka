@@ -4,9 +4,9 @@ import json
 import mimetypes
 import uuid
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urljoin
+from urllib.parse import quote, urlencode, urljoin
 from urllib.request import Request, urlopen
 
 
@@ -50,12 +50,17 @@ class FrameClient:
                 raise RuntimeError("Ramka nie udostępniła poprawnej listy plików. Wgraj nowe firmware.") from error
         files: list[FrameFile] = []
         for item in payload.get("files", []):
-            name = Path(str(item.get("name", ""))).name
-            if name.lower().endswith(".gif"):
+            name = str(item.get("name", "")).replace("\\", "/").lstrip("/")
+            parts = PurePosixPath(name).parts
+            if parts and ".." not in parts and len(parts) <= 2 and name.lower().endswith(".gif"):
                 files.append(FrameFile(name=name, size=int(item.get("size", 0))))
         return files
 
-    def upload_file(self, path: Path) -> None:
+    def upload_file(self, path: Path, remote_name: str | None = None) -> None:
+        remote = PurePosixPath((remote_name or path.name).replace("\\", "/"))
+        if ".." in remote.parts or len(remote.parts) > 2:
+            raise ValueError("Ramka obsługuje tylko jeden poziom folderów.")
+        folder = "" if len(remote.parts) == 1 else remote.parts[0]
         boundary = "----GifTool" + uuid.uuid4().hex
         mime_type = mimetypes.guess_type(path.name)[0] or "image/gif"
         header = (
@@ -64,8 +69,11 @@ class FrameClient:
             f"Content-Type: {mime_type}\r\n\r\n"
         ).encode("utf-8")
         body = header + path.read_bytes() + f"\r\n--{boundary}--\r\n".encode("ascii")
+        endpoint = "upload"
+        if folder:
+            endpoint += "?" + urlencode({"folder": folder})
         request = Request(
-            urljoin(self.base_url, "upload"),
+            urljoin(self.base_url, endpoint),
             data=body,
             method="POST",
             headers={
@@ -78,17 +86,20 @@ class FrameClient:
 
     def upload_all(self, folder: Path) -> list[Path]:
         files = sorted(
-            (path for path in folder.iterdir() if path.is_file() and path.suffix.lower() == ".gif"),
-            key=lambda path: path.name.lower(),
+            (path for path in folder.rglob("*.gif") if path.is_file()),
+            key=lambda path: path.relative_to(folder).as_posix().lower(),
         )
         for path in files:
-            self.upload_file(path)
+            self.upload_file(path, path.relative_to(folder).as_posix())
         return files
 
     def download_file(self, file: FrameFile, folder: Path) -> Path:
-        folder.mkdir(parents=True, exist_ok=True)
-        destination = folder / Path(file.name).name
-        request = Request(urljoin(self.base_url, f"file?name={quote(file.name)}"))
+        parts = PurePosixPath(file.name).parts
+        if not parts or ".." in parts or len(parts) > 2:
+            raise ValueError("Niepoprawna ścieżka pliku zwrócona przez ramkę.")
+        destination = folder.joinpath(*parts)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        request = Request(urljoin(self.base_url, f"file?name={quote(file.name, safe='')}"))
         with self._open(request) as response:
             data = response.read()
         destination.write_bytes(data)

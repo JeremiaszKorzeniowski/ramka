@@ -25,7 +25,13 @@ constexpr uint8_t ENCODER_SW = D3;
 constexpr int16_t SCREEN_WIDTH = 160;
 constexpr int16_t SCREEN_HEIGHT = 128;
 constexpr uint32_t SHOW_TIME_MS = 12000;
-constexpr uint8_t MAX_GIFS = 32;
+constexpr uint32_t ENCODER_DEBOUNCE_US = 10000;
+constexpr uint32_t ENCODER_DIRECTION_RESET_US = 600000;
+constexpr uint32_t BUTTON_DEBOUNCE_MS = 35;
+constexpr uint32_t BUTTON_LONG_PRESS_MS = 3000;
+constexpr uint8_t MAX_GIFS = 64;
+constexpr uint8_t MAX_FOLDERS = 12;
+constexpr uint8_t MAX_TAGS = 24;
 constexpr uint32_t MAX_DOWNLOAD_BYTES = 6UL * 1024UL * 1024UL;
 constexpr char WIFI_AP_NAME[] = "RAMKA-SETUP";
 constexpr char WIFI_AP_PASSWORD[] = "ramka123";
@@ -44,14 +50,31 @@ WiFiManager wifiManager;
 alignas(4) uint16_t scanline[SCREEN_WIDTH];
 String gifFiles[MAX_GIFS];
 uint8_t gifCount = 0;
+uint8_t activeFileIndexes[MAX_GIFS];
+uint8_t activeCount = 0;
+String gifFolders[MAX_FOLDERS];
+uint8_t folderCount = 0;
+String gifTags[MAX_TAGS];
+uint8_t tagCount = 0;
+String selectedFolder;
+String selectedTag;
+bool randomOrder = false;
 int16_t gifX = 0;
 int16_t gifY = 0;
 volatile int8_t encoderStep = 0;
-volatile bool encoderButtonPressed = false;
 volatile uint32_t lastEncoderUs = 0;
-volatile uint32_t lastButtonUs = 0;
+volatile uint32_t lastEncoderAcceptedUs = 0;
+volatile int8_t encoderDirection = 0;
+volatile int8_t reverseCandidate = 0;
+volatile uint8_t reverseCandidateCount = 0;
 bool autoPlay = true;
-bool autoPlayChanged = false;
+bool buttonRawDown = false;
+bool buttonStableDown = false;
+bool buttonLongHandled = false;
+bool buttonShortPress = false;
+bool buttonLongPress = false;
+uint32_t buttonChangedAtMs = 0;
+uint32_t buttonPressedAtMs = 0;
 bool networkReady = false;
 bool mdnsReady = false;
 bool libraryDirty = true;
@@ -73,25 +96,77 @@ void showMessage(const __FlashStringHelper *line1, const String &line2 = "") {
 
 void IRAM_ATTR onEncoderTurn() {
   const uint32_t now = micros();
-  if (now - lastEncoderUs < 2500) return;
+  if (now - lastEncoderUs < ENCODER_DEBOUNCE_US || encoderStep != 0) return;
   lastEncoderUs = now;
-  encoderStep = digitalRead(ENCODER_DT) ? 1 : -1;
+  const int8_t candidate = digitalRead(ENCODER_DT) ? 1 : -1;
+
+  // Podczas ciaglego obrotu kierunek pozostaje zablokowany. Zmiane kierunku
+  // przyjmujemy dopiero po przerwie i dwoch zgodnych przeciwnych impulsach.
+  if (encoderDirection == 0 || candidate == encoderDirection) {
+    encoderDirection = candidate;
+    reverseCandidate = 0;
+    reverseCandidateCount = 0;
+    encoderStep = candidate;
+    lastEncoderAcceptedUs = now;
+  } else {
+    if (now - lastEncoderAcceptedUs < ENCODER_DIRECTION_RESET_US) {
+      reverseCandidate = 0;
+      reverseCandidateCount = 0;
+      return;
+    }
+    if (reverseCandidate == candidate) {
+      ++reverseCandidateCount;
+    } else {
+      reverseCandidate = candidate;
+      reverseCandidateCount = 1;
+    }
+    if (reverseCandidateCount >= 2) {
+      encoderDirection = candidate;
+      reverseCandidate = 0;
+      reverseCandidateCount = 0;
+      encoderStep = candidate;
+      lastEncoderAcceptedUs = now;
+    }
+  }
 }
 
-void IRAM_ATTR onEncoderButton() {
-  const uint32_t now = micros();
-  if (now - lastButtonUs < 50000) return;
-  lastButtonUs = now;
-  encoderButtonPressed = true;
+void updateButton() {
+  const uint32_t now = millis();
+  const bool rawDown = digitalRead(ENCODER_SW) == LOW;
+  if (rawDown != buttonRawDown) {
+    buttonRawDown = rawDown;
+    buttonChangedAtMs = now;
+  }
+  if (now - buttonChangedAtMs >= BUTTON_DEBOUNCE_MS && rawDown != buttonStableDown) {
+    buttonStableDown = rawDown;
+    if (buttonStableDown) {
+      buttonPressedAtMs = now;
+      buttonLongHandled = false;
+    } else if (!buttonLongHandled) {
+      buttonShortPress = true;
+    }
+  }
+  if (buttonStableDown && !buttonLongHandled &&
+      now - buttonPressedAtMs >= BUTTON_LONG_PRESS_MS) {
+    buttonLongHandled = true;
+    buttonLongPress = true;
+  }
+}
+
+int8_t takeEncoderStep() {
+  noInterrupts();
+  const int8_t step = encoderStep;
+  encoderStep = 0;
+  interrupts();
+  return step;
 }
 
 bool pollControls() {
-  if (encoderButtonPressed) {
+  updateButton();
+  if (buttonShortPress || buttonLongPress) {
     noInterrupts();
-    encoderButtonPressed = false;
+    encoderStep = 0;
     interrupts();
-    autoPlay = !autoPlay;
-    autoPlayChanged = true;
     return true;
   }
   return encoderStep != 0;
@@ -184,21 +259,35 @@ bool openGif(const char *path) {
   return true;
 }
 
-String safeGifPath(String name) {
-  name.replace('\\', '/');
-  const int slash = name.lastIndexOf('/');
-  if (slash >= 0) name = name.substring(slash + 1);
+String cleanPathPart(const String &value, uint8_t maxLength) {
   String clean;
-  clean.reserve(48);
-  for (uint16_t i = 0; i < name.length() && clean.length() < 44; ++i) {
-    const char c = name[i];
+  clean.reserve(maxLength);
+  for (uint16_t i = 0; i < value.length() && clean.length() < maxLength; ++i) {
+    const char c = value[i];
     if (isalnum(static_cast<unsigned char>(c)) || c == '.' || c == '-' || c == '_') clean += c;
     else if (c == ' ') clean += '_';
   }
+  return clean;
+}
+
+String safeGifPath(String name) {
+  name.replace('\\', '/');
+  while (name.startsWith("/")) name.remove(0, 1);
+  if (name.indexOf("..") >= 0) return "";
+  const int slash = name.indexOf('/');
+  String folder;
+  String fileName = name;
+  if (slash >= 0) {
+    if (name.indexOf('/', slash + 1) >= 0) return "";
+    folder = cleanPathPart(name.substring(0, slash), 24);
+    fileName = name.substring(slash + 1);
+    if (!folder.length()) return "";
+  }
+  const String clean = cleanPathPart(fileName, 52);
   String lower = clean;
   lower.toLowerCase();
   if (!lower.endsWith(".gif") || clean.length() < 5) return "";
-  return "/" + clean;
+  return folder.length() ? "/" + folder + "/" + clean : "/" + clean;
 }
 
 String htmlEscape(String value) {
@@ -206,6 +295,7 @@ String htmlEscape(String value) {
   value.replace("<", "&lt;");
   value.replace(">", "&gt;");
   value.replace("\"", "&quot;");
+  value.replace("'", "&#39;");
   return value;
 }
 
@@ -217,63 +307,409 @@ String jsonEscape(String value) {
   return value;
 }
 
+String baseNameFromPath(const String &path) {
+  const int slash = path.lastIndexOf('/');
+  return slash >= 0 ? path.substring(slash + 1) : path;
+}
+
+String folderFromPath(const String &path) {
+  const int slash = path.lastIndexOf('/');
+  return slash <= 0 ? "/" : path.substring(0, slash);
+}
+
+String displayNameFromPath(const String &path) {
+  String name = baseNameFromPath(path);
+  const int extension = name.lastIndexOf('.');
+  if (extension > 0) name.remove(extension);
+  const int tags = name.indexOf("__");
+  if (tags >= 0) name.remove(tags);
+  return name;
+}
+
+bool isGifName(String name) {
+  name.toLowerCase();
+  return name.endsWith(".gif");
+}
+
+void addFolder(const String &folder) {
+  for (uint8_t i = 0; i < folderCount; ++i) {
+    if (gifFolders[i] == folder) return;
+  }
+  if (folderCount < MAX_FOLDERS) gifFolders[folderCount++] = folder;
+}
+
+void addTag(String tag) {
+  tag.trim();
+  tag.toLowerCase();
+  if (!tag.length()) return;
+  for (uint8_t i = 0; i < tagCount; ++i) {
+    if (gifTags[i] == tag) return;
+  }
+  if (tagCount < MAX_TAGS) gifTags[tagCount++] = tag;
+}
+
+void collectTags(const String &path) {
+  String name = baseNameFromPath(path);
+  const int marker = name.indexOf("__");
+  if (marker < 0) return;
+  const int extension = name.lastIndexOf('.');
+  String tags = name.substring(marker + 2, extension > marker ? extension : name.length());
+  int start = 0;
+  while (start < static_cast<int>(tags.length())) {
+    int end = tags.indexOf('_', start);
+    if (end < 0) end = tags.length();
+    addTag(tags.substring(start, end));
+    start = end + 1;
+  }
+}
+
+bool fileHasTag(const String &path, const String &wantedTag) {
+  if (!wantedTag.length()) return true;
+  String name = baseNameFromPath(path);
+  const int marker = name.indexOf("__");
+  if (marker < 0) return false;
+  const int extension = name.lastIndexOf('.');
+  String tags = name.substring(marker + 2, extension > marker ? extension : name.length());
+  tags.toLowerCase();
+  int start = 0;
+  while (start < static_cast<int>(tags.length())) {
+    int end = tags.indexOf('_', start);
+    if (end < 0) end = tags.length();
+    if (tags.substring(start, end) == wantedTag) return true;
+    start = end + 1;
+  }
+  return false;
+}
+
+void addGifPath(String path) {
+  path.replace('\\', '/');
+  if (!path.startsWith("/")) path = "/" + path;
+  if (gifCount >= MAX_GIFS || !isGifName(path)) return;
+  gifFiles[gifCount++] = path;
+  collectTags(path);
+}
+
+void shuffleActiveFiles(int previousLibraryIndex = -1) {
+  if (!randomOrder || activeCount < 2) return;
+  for (int i = activeCount - 1; i > 0; --i) {
+    const int j = random(i + 1);
+    const uint8_t tmp = activeFileIndexes[i];
+    activeFileIndexes[i] = activeFileIndexes[j];
+    activeFileIndexes[j] = tmp;
+  }
+  if (previousLibraryIndex >= 0 && activeFileIndexes[0] == previousLibraryIndex) {
+    const uint8_t tmp = activeFileIndexes[0];
+    activeFileIndexes[0] = activeFileIndexes[1];
+    activeFileIndexes[1] = tmp;
+  }
+}
+
+int rebuildActiveList(int preserveLibraryIndex = -1) {
+  activeCount = 0;
+  for (uint8_t i = 0; i < gifCount; ++i) {
+    const bool folderMatches = !selectedFolder.length() || folderFromPath(gifFiles[i]) == selectedFolder;
+    if (folderMatches && fileHasTag(gifFiles[i], selectedTag)) {
+      activeFileIndexes[activeCount++] = i;
+    }
+  }
+  shuffleActiveFiles();
+  for (uint8_t i = 0; i < activeCount; ++i) {
+    if (activeFileIndexes[i] == preserveLibraryIndex) return i;
+  }
+  return activeCount ? 0 : -1;
+}
+
+const String &activePath(int index) {
+  return gifFiles[activeFileIndexes[index]];
+}
+
+void sortLibraryLabels() {
+  for (uint8_t i = 0; i < gifCount; ++i) {
+    for (uint8_t j = i + 1; j < gifCount; ++j) {
+      if (gifFiles[j].compareTo(gifFiles[i]) < 0) {
+        const String tmp = gifFiles[i]; gifFiles[i] = gifFiles[j]; gifFiles[j] = tmp;
+      }
+    }
+  }
+  for (uint8_t i = 0; i < folderCount; ++i) {
+    for (uint8_t j = i + 1; j < folderCount; ++j) {
+      if (gifFolders[j].compareTo(gifFolders[i]) < 0) {
+        const String tmp = gifFolders[i]; gifFolders[i] = gifFolders[j]; gifFolders[j] = tmp;
+      }
+    }
+  }
+  for (uint8_t i = 0; i < tagCount; ++i) {
+    for (uint8_t j = i + 1; j < tagCount; ++j) {
+      if (gifTags[j].compareTo(gifTags[i]) < 0) {
+        const String tmp = gifTags[i]; gifTags[i] = gifTags[j]; gifTags[j] = tmp;
+      }
+    }
+  }
+}
+
 void scanGifFiles() {
   gifCount = 0;
+  folderCount = 0;
+  tagCount = 0;
   File root = SD.open("/");
   if (!root) {
+    activeCount = 0;
     libraryDirty = false;
     return;
   }
   File entry = root.openNextFile();
   while (entry && gifCount < MAX_GIFS) {
-    if (!entry.isDirectory() && entry.size() > 0) {
-      String path = entry.name();
-      if (!path.startsWith("/")) path = "/" + path;
-      String lower = path;
-      lower.toLowerCase();
-      if (lower.endsWith(".gif")) gifFiles[gifCount++] = path;
+    if (entry.isDirectory()) {
+      const String folder = "/" + baseNameFromPath(entry.name());
+      File directory = SD.open(folder);
+      if (directory) {
+        File child = directory.openNextFile();
+        while (child && gifCount < MAX_GIFS) {
+          if (!child.isDirectory() && child.size() > 0 && isGifName(child.name())) {
+            addFolder(folder);
+            addGifPath(folder + "/" + baseNameFromPath(child.name()));
+          }
+          child.close();
+          child = directory.openNextFile();
+          yield();
+        }
+        directory.close();
+      }
+    } else if (entry.size() > 0 && isGifName(entry.name())) {
+      addGifPath("/" + baseNameFromPath(entry.name()));
     }
     entry.close();
     entry = root.openNextFile();
     yield();
   }
   root.close();
-  for (uint8_t i = 0; i < gifCount; ++i) {
-    for (uint8_t j = i + 1; j < gifCount; ++j) {
-      if (gifFiles[j].compareTo(gifFiles[i]) < 0) {
-        const String tmp = gifFiles[i];
-        gifFiles[i] = gifFiles[j];
-        gifFiles[j] = tmp;
-      }
+  sortLibraryLabels();
+  rebuildActiveList();
+  libraryDirty = false;
+  Serial.printf("Biblioteka: %u GIF, %u folderow, %u tagow, aktywne: %u\n",
+                gifCount, folderCount, tagCount, activeCount);
+}
+
+void prepareMenuControls() {
+  buttonShortPress = false;
+  buttonLongPress = false;
+  noInterrupts();
+  encoderStep = 0;
+  encoderDirection = 0;
+  reverseCandidate = 0;
+  reverseCandidateCount = 0;
+  interrupts();
+}
+
+void drawFileMenu(int selected) {
+  constexpr uint8_t visibleRows = 9;
+  const int first = selected < visibleRows ? 0 : selected - visibleRows + 1;
+  tft.fillScreen(ST77XX_BLACK);
+  tft.setTextSize(1);
+  tft.setTextWrap(false);
+  tft.setTextColor(ST77XX_YELLOW);
+  tft.setCursor(3, 4);
+  tft.print(F("WYBIERZ GIF  "));
+  tft.print(selected + 1); tft.print('/'); tft.print(activeCount);
+  tft.drawFastHLine(0, 14, SCREEN_WIDTH, ST77XX_BLUE);
+  for (uint8_t row = 0; row < visibleRows; ++row) {
+    const int fileIndex = first + row;
+    if (fileIndex >= activeCount) break;
+    const int16_t y = 18 + row * 12;
+    const bool active = fileIndex == selected;
+    if (active) tft.fillRect(0, y - 2, SCREEN_WIDTH, 11, ST77XX_BLUE);
+    tft.setTextColor(active ? ST77XX_WHITE : ST77XX_CYAN);
+    tft.setCursor(3, y); tft.print(active ? '>' : ' ');
+    String name = displayNameFromPath(activePath(fileIndex));
+    if (name.length() > 23) name = name.substring(0, 22) + '~';
+    tft.print(name);
+  }
+}
+
+int selectGifFromMenu(int currentIndex) {
+  if (activeCount == 0) return -1;
+  int selected = constrain(currentIndex, 0, activeCount - 1);
+  prepareMenuControls();
+  drawFileMenu(selected);
+  while (true) {
+    serviceNetwork(); updateButton();
+    const int8_t step = takeEncoderStep();
+    if (step != 0) {
+      selected = (selected + step + activeCount) % activeCount;
+      drawFileMenu(selected);
+    }
+    if (buttonShortPress) {
+      buttonShortPress = false;
+      return selected;
+    }
+    if (buttonLongPress) {
+      buttonLongPress = false;
+      return -1;
+    }
+    delay(2);
+  }
+}
+
+String sourceLabel() {
+  if (!selectedFolder.length()) return "Wszystkie";
+  if (selectedFolder == "/") return "Glowny";
+  return selectedFolder.substring(1);
+}
+
+void drawChoiceMenu(const __FlashStringHelper *title, int selected, bool folders) {
+  const int count = folders ? folderCount + 2 : tagCount + 1;
+  constexpr uint8_t visibleRows = 8;
+  const int first = selected < visibleRows ? 0 : selected - visibleRows + 1;
+  tft.fillScreen(ST77XX_BLACK);
+  tft.setTextSize(1); tft.setTextWrap(false); tft.setTextColor(ST77XX_YELLOW);
+  tft.setCursor(3, 4); tft.print(title);
+  tft.drawFastHLine(0, 14, SCREEN_WIDTH, ST77XX_BLUE);
+  for (uint8_t row = 0; row < visibleRows; ++row) {
+    const int item = first + row;
+    if (item >= count) break;
+    const int16_t y = 20 + row * 13;
+    const bool active = item == selected;
+    if (active) tft.fillRect(0, y - 2, SCREEN_WIDTH, 12, ST77XX_BLUE);
+    tft.setTextColor(active ? ST77XX_WHITE : ST77XX_CYAN);
+    tft.setCursor(3, y); tft.print(active ? '>' : ' ');
+    String label;
+    if (folders) {
+      if (item == 0) label = "Wszystkie";
+      else if (item == 1) label = "Glowny";
+      else label = gifFolders[item - 2].substring(1);
+    } else label = item == 0 ? "Bez filtra" : gifTags[item - 1];
+    if (label.length() > 23) label = label.substring(0, 22) + '~';
+    tft.print(label);
+  }
+}
+
+int chooseLibraryFilter(bool folders) {
+  const int count = folders ? folderCount + 2 : tagCount + 1;
+  int selected = 0;
+  if (folders) {
+    if (selectedFolder == "/") selected = 1;
+    else for (uint8_t i = 0; i < folderCount; ++i) if (gifFolders[i] == selectedFolder) selected = i + 2;
+  } else {
+    for (uint8_t i = 0; i < tagCount; ++i) if (gifTags[i] == selectedTag) selected = i + 1;
+  }
+  prepareMenuControls();
+  drawChoiceMenu(folders ? F("ZRODLO") : F("TAG"), selected, folders);
+  while (true) {
+    serviceNetwork(); updateButton();
+    const int8_t step = takeEncoderStep();
+    if (step != 0) {
+      selected = (selected + step + count) % count;
+      drawChoiceMenu(folders ? F("ZRODLO") : F("TAG"), selected, folders);
+    }
+    if (buttonShortPress) { buttonShortPress = false; return selected; }
+    if (buttonLongPress) { buttonLongPress = false; return -1; }
+    delay(2);
+  }
+}
+
+void drawLibraryMenu(int selected) {
+  const String values[] = {
+    sourceLabel(),
+    selectedTag.length() ? selectedTag : "Brak",
+    randomOrder ? "Losowo" : "Po kolei",
+    "Otworz liste",
+    "Powrot"
+  };
+  const __FlashStringHelper *labels[] = {F("Zrodlo"), F("Tag"), F("Kolejnosc"), F("Plik"), F("Gotowe")};
+  tft.fillScreen(ST77XX_BLACK);
+  tft.setTextSize(1); tft.setTextWrap(false); tft.setTextColor(ST77XX_YELLOW);
+  tft.setCursor(3, 4); tft.print(F("BIBLIOTEKA"));
+  tft.drawFastHLine(0, 14, SCREEN_WIDTH, ST77XX_BLUE);
+  for (uint8_t row = 0; row < 5; ++row) {
+    const int16_t y = 22 + row * 20;
+    const bool active = row == selected;
+    if (active) tft.fillRect(0, y - 3, SCREEN_WIDTH, 18, ST77XX_BLUE);
+    tft.setTextColor(active ? ST77XX_WHITE : ST77XX_CYAN);
+    tft.setCursor(3, y); tft.print(active ? '>' : ' '); tft.print(labels[row]);
+    if (row < 4) {
+      String value = values[row];
+      if (value.length() > 12) value = value.substring(0, 11) + '~';
+      tft.setCursor(82, y); tft.print(value);
     }
   }
-  libraryDirty = false;
-  Serial.printf("Znaleziono GIF: %u\n", gifCount);
+}
+
+bool openLibraryMenu(int &currentIndex) {
+  int selected = 0;
+  prepareMenuControls();
+  drawLibraryMenu(selected);
+  while (true) {
+    serviceNetwork(); updateButton();
+    if (libraryDirty) {
+      scanGifFiles(); currentIndex = 0; drawLibraryMenu(selected);
+    }
+    const int8_t step = takeEncoderStep();
+    if (step != 0) {
+      selected = (selected + step + 5) % 5;
+      drawLibraryMenu(selected);
+    }
+    if (buttonLongPress) { buttonLongPress = false; return false; }
+    if (!buttonShortPress) { delay(2); continue; }
+    buttonShortPress = false;
+    const int preserved = activeCount ? activeFileIndexes[constrain(currentIndex, 0, activeCount - 1)] : -1;
+    if (selected == 0) {
+      const int choice = chooseLibraryFilter(true);
+      if (choice >= 0) {
+        selectedFolder = choice == 0 ? "" : choice == 1 ? "/" : gifFolders[choice - 2];
+        currentIndex = rebuildActiveList(preserved);
+      }
+    } else if (selected == 1) {
+      const int choice = chooseLibraryFilter(false);
+      if (choice >= 0) {
+        selectedTag = choice == 0 ? "" : gifTags[choice - 1];
+        currentIndex = rebuildActiveList(preserved);
+      }
+    } else if (selected == 2) {
+      randomOrder = !randomOrder;
+      currentIndex = rebuildActiveList(preserved);
+    } else if (selected == 3) {
+      const int choice = selectGifFromMenu(currentIndex < 0 ? 0 : currentIndex);
+      if (choice >= 0) { currentIndex = choice; return true; }
+    } else return false;
+    if (currentIndex < 0) currentIndex = 0;
+    prepareMenuControls();
+    drawLibraryMenu(selected);
+  }
+}
+
+bool playTimeRemaining(uint32_t startedAt, uint32_t durationMs) {
+  return durationMs == 0 || millis() - startedAt < durationMs;
 }
 
 void playFor(const char *path, uint32_t durationMs) {
   const uint32_t startedAt = millis();
   tft.fillScreen(ST77XX_BLACK);
-  while (millis() - startedAt < durationMs) {
+  while (playTimeRemaining(startedAt, durationMs)) {
     if (!openGif(path)) {
       showMessage(F("Niepoprawny GIF"), path);
       delay(1200);
       return;
     }
     uint16_t frameCount = 0;
-    while (millis() - startedAt < durationMs && gif.playFrame(true, nullptr)) {
-      ++frameCount;
+    while (playTimeRemaining(startedAt, durationMs)) {
+      // playFrame() zwraca 0 także wtedy, gdy właśnie narysował ostatnią
+      // klatkę. Liczenie tylko wartości true powodowało, że GIF z dwiema
+      // klatkami był błędnie uznawany za obraz jednoklatkowy.
+      const int playResult = gif.playFrame(true, nullptr);
+      if (playResult < 0) break;
+      if (gif.getLastError() == GIF_SUCCESS) ++frameCount;
       serviceNetwork();
       if (pollControls() || libraryDirty) {
         gif.close();
         return;
       }
+      if (playResult == 0) break;
       yield();
     }
     gif.close();
     // Jednoklatkowy GIF zostaje w pamieci kontrolera ST7735.
     if (frameCount <= 1) {
-      while (millis() - startedAt < durationMs) {
+      while (playTimeRemaining(startedAt, durationMs)) {
         serviceNetwork();
         if (pollControls() || libraryDirty) return;
         delay(1);
@@ -283,53 +719,57 @@ void playFor(const char *path, uint32_t durationMs) {
   }
 }
 
-String pageHeader() {
-  String page;
-  page.reserve(2600);
-  page += F("<!doctype html><html lang='pl'><head><meta charset='utf-8'>");
-  page += F("<meta name='viewport' content='width=device-width,initial-scale=1'><title>Ramka</title><style>");
-  page += F("body{font-family:system-ui;background:#111827;color:#f9fafb;max-width:760px;margin:auto;padding:20px}");
-  page += F("section{background:#1f2937;padding:18px;border-radius:14px;margin:14px 0}h1{margin-bottom:4px}");
-  page += F("input,button{font:inherit;padding:10px;border-radius:8px;border:1px solid #4b5563;margin:4px 0}");
-  page += F("input[type=text],input[type=url]{width:95%;background:#111827;color:white}");
-  page += F("button{background:#22c55e;color:#052e16;font-weight:700;cursor:pointer}.del{background:#ef4444;color:white}");
-  page += F("li{margin:9px 0}.muted{color:#9ca3af}code{color:#67e8f9}</style></head><body>");
-  page += F("<h1>Ramka ESP8266</h1><div class='muted'>");
-  page += htmlEscape(WiFi.SSID());
-  page += F(" · ");
-  page += WiFi.localIP().toString();
-  page += F(" · <code>ramka.local</code></div>");
-  return page;
+const char PAGE_HTML[] PROGMEM = R"RAMKAPAGE(
+<!doctype html><html lang="pl"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Ramka</title>
+<style>
+body{font-family:system-ui;background:#111827;color:#f9fafb;max-width:760px;margin:auto;padding:20px}
+section{background:#1f2937;padding:18px;border-radius:14px;margin:14px 0}h1{margin:0 0 4px}h2{margin-top:0}
+input,button{font:inherit;padding:10px;border-radius:8px;border:1px solid #4b5563;margin:4px 0}
+input[type=text],input[type=url]{width:calc(100% - 22px);background:#111827;color:white}
+button,.btn{display:inline-block;background:#22c55e;color:#052e16;font-weight:700;cursor:pointer;text-decoration:none;padding:10px;border-radius:8px;border:0}
+.del{background:#ef4444;color:white}ul{padding:0;list-style:none}
+li{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:9px 0;border-bottom:1px solid #374151}
+.name{overflow-wrap:anywhere;flex:1 1 280px}.muted{color:#9ca3af}code{color:#67e8f9}label{display:block;margin-top:8px}
+@media(max-width:520px){body{padding:12px}section{padding:14px}}
+</style></head><body>
+<h1>Ramka ESP8266</h1><div class="muted">Panel <code>ramka.local</code></div>
+<section><h2>Wgraj z komputera</h2><form method="post" action="/upload" enctype="multipart/form-data">
+<input type="file" name="gif" accept=".gif,image/gif" required>
+<label>Folder na karcie (opcjonalny)</label><input type="text" name="folder" placeholder="np. rodzina">
+<button>Wgraj GIF</button></form></section>
+<section><h2>Pobierz z internetu</h2><form method="post" action="/download">
+<label>Bezposredni adres GIF</label><input type="url" name="url" placeholder="https://.../obraz.gif" required>
+<label>Nazwa na karcie (opcjonalna)</label><input type="text" name="name" placeholder="obraz.gif">
+<button>Pobierz na SD</button></form><p class="muted">Maksymalnie 6 MB. Obraz nie moze przekraczac 160x128 px.</p></section>
+<section><h2>Animacje na karcie <span id="count" class="muted"></span></h2><ul id="files"><li>Ladowanie...</li></ul></section>
+<section><h2>Wi-Fi</h2><form method="post" action="/wifi-reset"><button class="del">Usun zapisane Wi-Fi</button></form></section>
+<script>
+async function loadFiles(){
+ const list=document.getElementById('files');
+ try{
+  const response=await fetch('/api/files',{cache:'no-store'});
+  if(!response.ok)throw new Error('HTTP '+response.status);
+  const data=await response.json();document.getElementById('count').textContent='('+data.files.length+')';list.replaceChildren();
+  if(!data.files.length){const li=document.createElement('li');li.textContent='Brak plikow GIF';list.append(li);return}
+  for(const file of data.files){
+   const li=document.createElement('li'),info=document.createElement('span'),title=document.createElement('b'),size=document.createElement('span');
+   info.className='name';title.textContent=file.name;size.className='muted';size.textContent=' '+(file.size/1024).toFixed(1)+' kB';info.append(title,size);
+   const download=document.createElement('a');download.className='btn';download.textContent='Pobierz';download.href='/file?name='+encodeURIComponent(file.name);
+   const form=document.createElement('form');form.method='post';form.action='/delete';
+   const hidden=document.createElement('input');hidden.type='hidden';hidden.name='name';hidden.value=file.name;
+   const remove=document.createElement('button');remove.className='del';remove.textContent='Usun';form.append(hidden,remove);li.append(info,download,form);list.append(li)
+  }
+ }catch(error){list.innerHTML='<li>Nie mozna pobrac listy: '+error.message+'</li>'}
 }
+loadFiles();
+</script></body></html>
+)RAMKAPAGE";
 
 void handleRoot() {
-  String page = pageHeader();
-  page += F("<section><h2>Animacje na karcie</h2><ul>");
-  if (gifCount == 0) page += F("<li>Brak plikow GIF</li>");
-  for (uint8_t i = 0; i < gifCount; ++i) {
-    File file = SD.open(gifFiles[i], FILE_READ);
-    const uint32_t size = file ? file.size() : 0;
-    file.close();
-    const String displayName = htmlEscape(gifFiles[i].substring(1));
-    page += F("<li><b>");
-    page += displayName;
-    page += F("</b> <span class='muted'>");
-    page += String(size / 1024.0f, 1);
-    page += F(" kB</span> <form method='post' action='/delete' style='display:inline'>");
-    page += F("<input type='hidden' name='name' value='");
-    page += displayName;
-    page += F("'><button class='del'>Usun</button></form></li>");
-  }
-  page += F("</ul></section>");
-  page += F("<section><h2>Wgraj z komputera</h2><form method='post' action='/upload' enctype='multipart/form-data'>");
-  page += F("<input type='file' name='gif' accept='.gif,image/gif' required> <button>Wgraj GIF</button></form></section>");
-  page += F("<section><h2>Pobierz z internetu</h2><form method='post' action='/download'>");
-  page += F("<label>Bezposredni adres GIF</label><input type='url' name='url' placeholder='https://.../obraz.gif' required>");
-  page += F("<label>Nazwa na karcie (opcjonalna)</label><input type='text' name='name' placeholder='obraz.gif'>");
-  page += F("<button>Pobierz na SD</button></form><p class='muted'>Maksymalnie 6 MB. Obraz nie moze przekraczac 160x128 px.</p></section>");
-  page += F("<section><h2>Wi-Fi</h2><form method='post' action='/wifi-reset'>");
-  page += F("<button class='del'>Usun zapisane Wi-Fi</button></form></section></body></html>");
-  server.send(200, "text/html; charset=utf-8", page);
+  // Stala strona jest czytana prosto z flash. Lista plikow jest pobierana
+  // osobno z lekkiego API, wiec liczba GIF-ow nie zuzywa RAM-u ESP8266.
+  server.send_P(200, PSTR("text/html; charset=utf-8"), PAGE_HTML);
 }
 
 void handleUploadData() {
@@ -337,6 +777,20 @@ void handleUploadData() {
   if (upload.status == UPLOAD_FILE_START) {
     uploadError = "";
     uploadTarget = safeGifPath(upload.filename);
+    const String requestedFolder = server.arg("folder");
+    if (requestedFolder.length()) {
+      const String folder = cleanPathPart(requestedFolder, 24);
+      if (!folder.length() || folder != requestedFolder) {
+        uploadError = "Niepoprawna nazwa folderu";
+        return;
+      }
+      const String folderPath = "/" + folder;
+      if (!SD.exists(folderPath) && !SD.mkdir(folderPath)) {
+        uploadError = "Nie mozna utworzyc folderu";
+        return;
+      }
+      uploadTarget = folderPath + uploadTarget;
+    }
     SD.remove(UPLOAD_TEMP_FILE);
     if (!uploadTarget.length()) {
       uploadError = "Nazwa musi konczyc sie na .gif";
@@ -508,7 +962,7 @@ void handleFileDownload() {
     server.send(404, "text/plain; charset=utf-8", "Nie znaleziono pliku");
     return;
   }
-  server.sendHeader("Content-Disposition", "attachment; filename=\"" + path.substring(1) + "\"");
+  server.sendHeader("Content-Disposition", "attachment; filename=\"" + baseNameFromPath(path) + "\"");
   server.sendHeader("Cache-Control", "no-store");
   server.streamFile(file, "image/gif");
   file.close();
@@ -576,10 +1030,14 @@ void setup() {
   pinMode(ENCODER_CLK, INPUT_PULLUP);
   pinMode(ENCODER_DT, INPUT_PULLUP);
   pinMode(ENCODER_SW, INPUT_PULLUP);
+  buttonRawDown = digitalRead(ENCODER_SW) == LOW;
+  buttonStableDown = buttonRawDown;
+  buttonChangedAtMs = millis();
+  buttonPressedAtMs = millis();
+  buttonLongHandled = buttonStableDown;
   digitalWrite(TFT_CS, HIGH);
   digitalWrite(SD_CARD_CS, HIGH);
   attachInterrupt(digitalPinToInterrupt(ENCODER_CLK), onEncoderTurn, FALLING);
-  attachInterrupt(digitalPinToInterrupt(ENCODER_SW), onEncoderButton, FALLING);
   SPI.begin();
   tft.initR(INITR_BLACKTAB);
   tft.setRotation(1);
@@ -590,8 +1048,9 @@ void setup() {
     while (true) delay(1000);
   }
   gif.begin(LITTLE_ENDIAN_PIXELS);
+  randomSeed(ESP.getCycleCount() ^ micros());
   scanGifFiles();
-  showMessage(F("Karta SD OK"), String("GIF: ") + gifCount);
+  showMessage(F("Karta SD OK"), String("GIF: ") + gifCount + " / aktywne: " + activeCount);
   delay(700);
   startWifi();
 }
@@ -602,35 +1061,54 @@ void loop() {
   serviceNetwork();
   if (libraryDirty) {
     scanGifFiles();
-    if (index >= gifCount) index = 0;
+    if (index >= activeCount) index = 0;
     emptyMessageShown = false;
   }
-  if (gifCount == 0) {
+  if (activeCount == 0) {
     if (!emptyMessageShown) {
-      showMessage(F("Brak plikow GIF"), networkReady ? "Otworz ramka.local" : "Wloz pliki na karte SD");
+      showMessage(gifCount == 0 ? F("Brak plikow GIF") : F("Brak dla filtra"),
+                  gifCount == 0 ? "Wloz pliki na karte SD" : "Przytrzymaj 3 sekundy");
       emptyMessageShown = true;
     }
     serviceNetwork();
+    updateButton();
+    if (buttonLongPress) {
+      buttonLongPress = false;
+      openLibraryMenu(index);
+      emptyMessageShown = false;
+    }
     delay(2);
     return;
   }
 
-  const String currentPath = gifFiles[index];
-  playFor(currentPath.c_str(), SHOW_TIME_MS);
+  const String currentPath = activePath(index);
+  playFor(currentPath.c_str(), autoPlay ? SHOW_TIME_MS : 0);
   if (libraryDirty) return;
-  if (encoderStep != 0) {
-    noInterrupts();
-    const int8_t step = encoderStep;
-    encoderStep = 0;
-    interrupts();
-    index = (index + step + gifCount) % gifCount;
+  if (buttonLongPress) {
+    buttonLongPress = false;
+    const bool fileSelected = openLibraryMenu(index);
+    if (fileSelected && activeCount > 0) {
+      autoPlay = false;
+      showMessage(F("TRYB: WYBRANY"), displayNameFromPath(activePath(index)));
+      delay(600);
+    }
+  } else if (buttonShortPress) {
+    buttonShortPress = false;
+    autoPlay = !autoPlay;
+    showMessage(autoPlay ? F("TRYB: PO KOLEI") : F("TRYB: WYBRANY"),
+                displayNameFromPath(activePath(index)));
+    Serial.println(autoPlay ? F("Tryb: po kolei") : F("Tryb: tylko wybrany"));
+    delay(600);
+  } else if (encoderStep != 0) {
+    const int8_t step = takeEncoderStep();
+    index = (index + step + activeCount) % activeCount;
     Serial.println(step > 0 ? F("Enkoder: +1") : F("Enkoder: -1"));
-  } else if (autoPlayChanged) {
-    showMessage(autoPlay ? F("AUTO: ON") : F("AUTO: OFF"));
-    Serial.println(autoPlay ? F("AUTO: ON") : F("AUTO: OFF"));
-    delay(500);
-    autoPlayChanged = false;
   } else if (autoPlay) {
-    index = (index + 1) % gifCount;
+    if (index + 1 < activeCount) ++index;
+    else {
+      const int previousLibraryIndex = activeFileIndexes[index];
+      shuffleActiveFiles(previousLibraryIndex);
+      index = 0;
+    }
   }
 }

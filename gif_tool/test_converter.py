@@ -1,6 +1,6 @@
-from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase, main
+from pathlib import Path
 
 from PIL import Image, ImageDraw
 
@@ -66,8 +66,11 @@ class ArtisticConversionTests(TestCase):
             self.assertIsNotNone(anime.large_output)
             assert anime.large_output is not None
             with Image.open(anime.large_output) as large_anime:
-                colors = large_anime.convert("RGB").getcolors(maxcolors=65536) or []
-                self.assertGreater(len(colors), 2)
+                rgb_anime = large_anime.convert("RGB")
+                colors = rgb_anime.getcolors(maxcolors=65536) or []
+                self.assertGreater(len(colors), 24)
+                darkest = min(sum(color) for _count, color in colors)
+                self.assertGreater(darkest, 20)
 
     def test_animation_keeps_frames_and_timing_in_both_versions(self) -> None:
         with TemporaryDirectory() as directory:
@@ -75,7 +78,7 @@ class ArtisticConversionTests(TestCase):
             source = workdir / "animation.gif"
             first = Image.new("RGB", TARGET_SIZE, "white")
             second = Image.new("RGB", TARGET_SIZE, "black")
-            first.save(source, save_all=True, append_images=[second], duration=[80, 140], loop=0)
+            first.save(source, save_all=True, append_images=[second], duration=[80, 140], loop=1)
 
             result = convert_style(source, workdir, "manga")
 
@@ -84,6 +87,7 @@ class ArtisticConversionTests(TestCase):
                 assert output is not None
                 with Image.open(output) as animation:
                     self.assertEqual(animation.n_frames, 2)
+                    self.assertEqual(animation.info["loop"], 0)
                     durations = []
                     for index in range(animation.n_frames):
                         animation.seek(index)
@@ -100,6 +104,69 @@ class ArtisticConversionTests(TestCase):
 
             self.assertIn("standard-160x128", result.output.name)
             self.assertIsNone(result.large_output)
+
+    def test_tags_and_folder_are_encoded_in_output_path(self) -> None:
+        with TemporaryDirectory() as directory:
+            workdir = Path(directory)
+            source = workdir / "Kicia 2.png"
+            make_photo(source)
+
+            result = convert_style(
+                source,
+                workdir,
+                "standard",
+                tags=["Kot", "Śmieszne", "kot"],
+                output_subfolder="Zdjęcia rodzinne",
+            )
+
+            self.assertEqual(result.output.parent.name, "zdjecia-rodzinne")
+            self.assertEqual(
+                result.output.name,
+                "kicia-2-standard-160x128__kot_smieszne.gif",
+            )
+
+    def test_manual_crop_box_controls_selected_area(self) -> None:
+        with TemporaryDirectory() as directory:
+            workdir = Path(directory)
+            source = workdir / "wide.png"
+            image = Image.new("RGB", (250, 100), "red")
+            ImageDraw.Draw(image).rectangle((125, 0, 249, 99), fill="blue")
+            image.save(source)
+
+            result = convert_style(
+                source,
+                workdir,
+                "standard",
+                crop_box=(0.0, 0.0, 0.5, 1.0),
+            )
+
+            with Image.open(result.output) as converted:
+                red, green, blue = converted.convert("RGB").getpixel((80, 64))
+                self.assertGreater(red, 200)
+                self.assertLess(green, 40)
+                self.assertLess(blue, 40)
+
+    def test_crop_outside_portrait_adds_black_side_background(self) -> None:
+        with TemporaryDirectory() as directory:
+            workdir = Path(directory)
+            source = workdir / "portrait.png"
+            Image.new("RGB", (100, 200), "#20d060").save(source)
+
+            result = convert_style(
+                source,
+                workdir,
+                "standard",
+                crop_box=(-0.75, 0.0, 1.75, 1.0),
+            )
+
+            with Image.open(result.output) as converted:
+                rgb = converted.convert("RGB")
+                left = rgb.getpixel((5, 64))
+                center = rgb.getpixel((80, 64))
+                right = rgb.getpixel((154, 64))
+                self.assertLess(max(left), 25)
+                self.assertGreater(center[1], 150)
+                self.assertLess(max(right), 25)
 
     def test_extreme_compression_targets_25_kb(self) -> None:
         with TemporaryDirectory() as directory:

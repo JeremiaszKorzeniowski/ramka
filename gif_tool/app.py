@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import sys
 import threading
@@ -14,11 +15,13 @@ from tkinterdnd2 import DND_FILES, TkinterDnD
 from converter import (
     COMPRESSION_PRESETS,
     CONVERSION_STYLES,
+    CropBox,
     OUTPUT_FOLDER_NAME,
     PALETTES,
     PIXEL_STYLES,
     BatchConversionResult,
     convert_many,
+    metadata_token,
     validate_source,
 )
 from frame_client import FRAME_IMAGES_FOLDER_NAME, SEND_FOLDER_NAME, FrameClient
@@ -43,11 +46,16 @@ class GifTool(TkinterDnD.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("GIF 160×128 • Pixel Tool")
-        self.geometry("760x790")
-        self.minsize(700, 730)
+        self.geometry("780x900")
+        self.minsize(720, 820)
         self.configure(bg=BG)
         self.sources: list[Path] = []
         self.preview_photo: ImageTk.PhotoImage | None = None
+        self.preview_source_image: Image.Image | None = None
+        self.preview_image_box = (0.0, 0.0, 1.0, 1.0)
+        self.crop_boxes: dict[Path, CropBox] = {}
+        self.current_source_index = 0
+        self.drag_position: tuple[int, int] | None = None
         self.output_dir = application_dir()
         self.send_dir = self.output_dir / SEND_FOLDER_NAME
         self.frame_images_dir = self.output_dir / FRAME_IMAGES_FOLDER_NAME
@@ -73,17 +81,43 @@ class GifTool(TkinterDnD.Tk):
         body.grid_columnconfigure(1, weight=2)
         body.grid_rowconfigure(0, weight=1)
 
-        self.drop = tk.Frame(body, bg=DROP_BG, highlightbackground="#475569", highlightthickness=2, cursor="hand2")
+        self.drop = tk.Frame(body, bg=DROP_BG, highlightbackground="#475569", highlightthickness=2)
         self.drop.grid(row=0, column=0, sticky="nsew", padx=(0, 16))
-        self.preview = tk.Label(self.drop, text="↓", font=("Segoe UI", 42, "bold"), bg=DROP_BG, fg=BLUE)
-        self.preview.pack(expand=True, pady=(24, 4))
+        self.preview = tk.Canvas(
+            self.drop, width=430, height=330, bg=DROP_BG,
+            highlightthickness=0, cursor="fleur",
+        )
+        self.preview.pack(fill="both", expand=True, padx=10, pady=(10, 4))
+        self.preview.create_text(215, 155, text="↓", font=("Segoe UI", 42, "bold"), fill=BLUE)
+        self.preview.create_text(215, 210, text="Przeciągnij tutaj pliki", font=("Segoe UI", 12, "bold"), fill=TEXT)
+        self.preview.bind("<ButtonPress-1>", self.start_crop_drag)
+        self.preview.bind("<B1-Motion>", self.drag_crop)
+        self.preview.bind("<ButtonRelease-1>", lambda _event: self.stop_crop_drag())
+        self.preview.bind("<MouseWheel>", self.crop_mousewheel)
+        self.preview.bind("<Double-Button-1>", lambda _event: self.choose_file())
+        self.preview.bind("<Configure>", lambda _event: self.render_preview())
+
+        navigation = tk.Frame(self.drop, bg=DROP_BG)
+        navigation.pack(fill="x", padx=14, pady=(2, 4))
+        tk.Button(navigation, text="◀", command=lambda: self.change_preview(-1), bg=PANEL, fg=TEXT, relief="flat", width=4).pack(side="left")
+        self.preview_counter = tk.Label(navigation, text="0 / 0", bg=DROP_BG, fg=MUTED, font=("Segoe UI", 9))
+        self.preview_counter.pack(side="left", expand=True)
+        tk.Button(navigation, text="▶", command=lambda: self.change_preview(1), bg=PANEL, fg=TEXT, relief="flat", width=4).pack(side="right")
+
+        crop_controls = tk.Frame(self.drop, bg=DROP_BG)
+        crop_controls.pack(fill="x", padx=14, pady=(0, 8))
+        tk.Label(crop_controls, text="Kadr 5:4", bg=DROP_BG, fg=MUTED, font=("Segoe UI", 9, "bold")).pack(side="left")
+        tk.Button(crop_controls, text="−", command=lambda: self.zoom_crop(1.15), bg=PANEL, fg=TEXT, relief="flat", width=4).pack(side="left", padx=(12, 4))
+        tk.Button(crop_controls, text="+", command=lambda: self.zoom_crop(0.87), bg=PANEL, fg=TEXT, relief="flat", width=4).pack(side="left")
+        tk.Button(crop_controls, text="Reset", command=self.reset_crop, bg=PANEL, fg=TEXT, relief="flat", padx=10).pack(side="right")
+        tk.Button(crop_controls, text="Całość", command=self.fit_whole_image, bg=PANEL, fg=TEXT, relief="flat", padx=10).pack(side="right", padx=(0, 5))
         self.file_label = tk.Label(self.drop, text="Przeciągnij tutaj pliki", font=("Segoe UI", 13, "bold"), bg=DROP_BG, fg=TEXT, wraplength=380)
         self.file_label.pack(padx=20)
-        tk.Label(self.drop, text="lub kliknij, aby wybrać", font=("Segoe UI", 9), bg=DROP_BG, fg=MUTED).pack(pady=(5, 24))
+        tk.Label(self.drop, text="Podwójne kliknięcie wybiera pliki • kółko zmienia zoom", font=("Segoe UI", 9), bg=DROP_BG, fg=MUTED).pack(pady=(5, 14))
         for widget in (self.drop, self.preview, self.file_label):
-            widget.bind("<Button-1>", lambda _event: self.choose_file())
             widget.drop_target_register(DND_FILES)
             widget.dnd_bind("<<Drop>>", self.on_drop)
+        self.file_label.bind("<Button-1>", lambda _event: self.choose_file())
 
         options = tk.Frame(body, bg=PANEL, padx=20, pady=20)
         options.grid(row=0, column=1, sticky="nsew")
@@ -97,6 +131,18 @@ class GifTool(TkinterDnD.Tk):
         tk.Label(options, text="Kompresja GIF", font=("Segoe UI", 9), bg=PANEL, fg=TEXT).pack(anchor="w", pady=(18, 5))
         self.compression_var = tk.StringVar(value=list(COMPRESSION_PRESETS)[1])
         ttk.Combobox(options, textvariable=self.compression_var, values=list(COMPRESSION_PRESETS), state="readonly").pack(fill="x")
+        tk.Label(options, text="Folder na karcie", font=("Segoe UI", 9), bg=PANEL, fg=TEXT).pack(anchor="w", pady=(18, 5))
+        self.folder_var = tk.StringVar(value="glowny")
+        tk.Entry(
+            options, textvariable=self.folder_var, bg=DROP_BG, fg=TEXT,
+            insertbackground=TEXT, relief="flat", bd=0, font=("Segoe UI", 9),
+        ).pack(fill="x", ipady=8)
+        tk.Label(options, text="Tagi (przecinki lub spacje)", font=("Segoe UI", 9), bg=PANEL, fg=TEXT).pack(anchor="w", pady=(18, 5))
+        self.tags_var = tk.StringVar()
+        tk.Entry(
+            options, textvariable=self.tags_var, bg=DROP_BG, fg=TEXT,
+            insertbackground=TEXT, relief="flat", bd=0, font=("Segoe UI", 9),
+        ).pack(fill="x", ipady=8)
         tk.Label(options, text="Adres ramki", font=("Segoe UI", 9), bg=PANEL, fg=TEXT).pack(anchor="w", pady=(18, 5))
         self.frame_address_var = tk.StringVar(value="http://ramka.local")
         tk.Entry(
@@ -109,7 +155,7 @@ class GifTool(TkinterDnD.Tk):
             bd=0,
             font=("Segoe UI", 9),
         ).pack(fill="x", ipady=8)
-        tk.Label(options, text="Obraz zostanie centralnie przycięty do proporcji 5:4.", font=("Segoe UI", 9), bg=PANEL, fg=MUTED, wraplength=210, justify="left").pack(anchor="w", pady=(22, 0))
+        tk.Label(options, text="Do wyniku trafi obszar zaznaczony żółtą ramką 5:4.", font=("Segoe UI", 9), bg=PANEL, fg=MUTED, wraplength=210, justify="left").pack(anchor="w", pady=(22, 0))
 
         actions = tk.Frame(self, bg=BG)
         actions.pack(fill="x", padx=32, pady=(18, 0))
@@ -151,6 +197,176 @@ class GifTool(TkinterDnD.Tk):
     def _button(self, parent: tk.Widget, text: str, color: str, command) -> tk.Button:
         return tk.Button(parent, text=text, command=command, bg=color, fg="white", activebackground=color, activeforeground="white", relief="flat", bd=0, padx=18, pady=13, cursor="hand2", font=("Segoe UI", 10, "bold"))
 
+    @staticmethod
+    def default_crop_box(size: tuple[int, int]) -> CropBox:
+        width, height = size
+        target_ratio = 5 / 4
+        if width / height > target_ratio:
+            normalized_width = height * target_ratio / width
+            margin = (1 - normalized_width) / 2
+            return margin, 0.0, 1 - margin, 1.0
+        normalized_height = width / target_ratio / height
+        margin = (1 - normalized_height) / 2
+        return 0.0, margin, 1.0, 1 - margin
+
+    @staticmethod
+    def whole_image_crop_box(size: tuple[int, int]) -> CropBox:
+        width, height = size
+        target_ratio = 5 / 4
+        if width / height > target_ratio:
+            normalized_height = width / target_ratio / height
+            margin = (normalized_height - 1) / 2
+            return 0.0, -margin, 1.0, 1 + margin
+        normalized_width = height * target_ratio / width
+        margin = (normalized_width - 1) / 2
+        return -margin, 0.0, 1 + margin, 1.0
+
+    @staticmethod
+    def open_preview_image(path: Path) -> Image.Image:
+        with Image.open(path) as image:
+            image.seek(0)
+            return ImageOps.exif_transpose(image).convert("RGB")
+
+    def current_source(self) -> Path | None:
+        if not self.sources:
+            return None
+        return self.sources[self.current_source_index]
+
+    def load_current_preview(self) -> None:
+        source = self.current_source()
+        if source is None:
+            self.preview_source_image = None
+            self.render_preview()
+            return
+        self.preview_source_image = self.open_preview_image(source)
+        self.crop_boxes.setdefault(source, self.default_crop_box(self.preview_source_image.size))
+        self.preview_counter.configure(text=f"{self.current_source_index + 1} / {len(self.sources)}")
+        self.render_preview()
+
+    def render_preview(self) -> None:
+        self.preview.delete("all")
+        source = self.current_source()
+        image = self.preview_source_image
+        width = max(120, self.preview.winfo_width())
+        height = max(120, self.preview.winfo_height())
+        if source is None or image is None:
+            self.preview.create_text(width / 2, height / 2 - 20, text="↓", font=("Segoe UI", 42, "bold"), fill=BLUE)
+            self.preview.create_text(width / 2, height / 2 + 35, text="Przeciągnij tutaj pliki", font=("Segoe UI", 12, "bold"), fill=TEXT)
+            return
+        x0, y0, x1, y1 = self.crop_boxes[source]
+        outer_x0, outer_y0, outer_x1, outer_y1 = self.whole_image_crop_box(image.size)
+        image_width, image_height = image.size
+        view_x0, view_y0 = min(0.0, outer_x0), min(0.0, outer_y0)
+        view_x1, view_y1 = max(1.0, outer_x1), max(1.0, outer_y1)
+        canvas_width = max(1, round((view_x1 - view_x0) * image_width))
+        canvas_height = max(1, round((view_y1 - view_y0) * image_height))
+        preview_canvas = Image.new("RGB", (canvas_width, canvas_height), "black")
+        paste_x = round(-view_x0 * image_width)
+        paste_y = round(-view_y0 * image_height)
+        preview_canvas.paste(image, (paste_x, paste_y))
+        shown = ImageOps.contain(preview_canvas, (max(1, width - 20), max(1, height - 20)), Image.Resampling.LANCZOS)
+        x = (width - shown.width) / 2
+        y = (height - shown.height) / 2
+        self.preview_photo = ImageTk.PhotoImage(shown)
+        self.preview.create_image(x, y, image=self.preview_photo, anchor="nw")
+        scale_x = shown.width / canvas_width
+        scale_y = shown.height / canvas_height
+        image_x = x + paste_x * scale_x
+        image_y = y + paste_y * scale_y
+        shown_image_width = image_width * scale_x
+        shown_image_height = image_height * scale_y
+        self.preview_image_box = (image_x, image_y, shown_image_width, shown_image_height)
+        left = image_x + x0 * shown_image_width
+        top = image_y + y0 * shown_image_height
+        right = image_x + x1 * shown_image_width
+        bottom = image_y + y1 * shown_image_height
+        self.preview.create_rectangle(left, top, right, bottom, outline="#facc15", width=3)
+        handle = 5
+        for hx, hy in ((left, top), (right, top), (left, bottom), (right, bottom)):
+            self.preview.create_rectangle(hx - handle, hy - handle, hx + handle, hy + handle, fill="#ef4444", outline="#fef08a")
+        self.preview.create_text(left + 7, top + 7, text="KADR 5:4", anchor="nw", fill="#facc15", font=("Segoe UI", 8, "bold"))
+
+    def crop_canvas_box(self) -> tuple[float, float, float, float] | None:
+        source = self.current_source()
+        if source is None:
+            return None
+        x, y, width, height = self.preview_image_box
+        x0, y0, x1, y1 = self.crop_boxes[source]
+        return x + x0 * width, y + y0 * height, x + x1 * width, y + y1 * height
+
+    def start_crop_drag(self, event) -> None:
+        box = self.crop_canvas_box()
+        if box is None:
+            self.choose_file()
+            return
+        left, top, right, bottom = box
+        self.drag_position = (event.x, event.y) if left <= event.x <= right and top <= event.y <= bottom else None
+
+    def drag_crop(self, event) -> None:
+        source = self.current_source()
+        if source is None or self.drag_position is None:
+            return
+        _x, _y, shown_width, shown_height = self.preview_image_box
+        previous_x, previous_y = self.drag_position
+        dx = (event.x - previous_x) / shown_width
+        dy = (event.y - previous_y) / shown_height
+        x0, y0, x1, y1 = self.crop_boxes[source]
+        crop_width, crop_height = x1 - x0, y1 - y0
+        assert self.preview_source_image is not None
+        outer_x0, outer_y0, outer_x1, outer_y1 = self.whole_image_crop_box(self.preview_source_image.size)
+        new_x0 = min(max(outer_x0, x0 + dx), outer_x1 - crop_width)
+        new_y0 = min(max(outer_y0, y0 + dy), outer_y1 - crop_height)
+        self.crop_boxes[source] = new_x0, new_y0, new_x0 + crop_width, new_y0 + crop_height
+        self.drag_position = (event.x, event.y)
+        self.render_preview()
+
+    def stop_crop_drag(self) -> None:
+        self.drag_position = None
+
+    def zoom_crop(self, factor: float) -> None:
+        source = self.current_source()
+        if source is None:
+            return
+        x0, y0, x1, y1 = self.crop_boxes[source]
+        center_x, center_y = (x0 + x1) / 2, (y0 + y1) / 2
+        new_width = (x1 - x0) * factor
+        new_height = (y1 - y0) * factor
+        if new_width < 0.08 or new_height < 0.08:
+            return
+        assert self.preview_source_image is not None
+        outer_x0, outer_y0, outer_x1, outer_y1 = self.whole_image_crop_box(self.preview_source_image.size)
+        max_width, max_height = outer_x1 - outer_x0, outer_y1 - outer_y0
+        scale = min(1.0, max_width / new_width, max_height / new_height)
+        new_width *= scale
+        new_height *= scale
+        new_x0 = min(max(outer_x0, center_x - new_width / 2), outer_x1 - new_width)
+        new_y0 = min(max(outer_y0, center_y - new_height / 2), outer_y1 - new_height)
+        self.crop_boxes[source] = new_x0, new_y0, new_x0 + new_width, new_y0 + new_height
+        self.render_preview()
+
+    def crop_mousewheel(self, event) -> None:
+        self.zoom_crop(0.9 if event.delta > 0 else 1.1)
+
+    def reset_crop(self) -> None:
+        source = self.current_source()
+        if source is None or self.preview_source_image is None:
+            return
+        self.crop_boxes[source] = self.default_crop_box(self.preview_source_image.size)
+        self.render_preview()
+
+    def fit_whole_image(self) -> None:
+        source = self.current_source()
+        if source is None or self.preview_source_image is None:
+            return
+        self.crop_boxes[source] = self.whole_image_crop_box(self.preview_source_image.size)
+        self.render_preview()
+
+    def change_preview(self, step: int) -> None:
+        if not self.sources:
+            return
+        self.current_source_index = (self.current_source_index + step) % len(self.sources)
+        self.load_current_preview()
+
     def choose_file(self) -> None:
         filenames = filedialog.askopenfilenames(title="Wybierz obrazy lub GIF-y", filetypes=[("Obrazy", "*.png *.jpg *.jpeg *.webp *.bmp *.tif *.tiff *.gif"), ("Wszystkie pliki", "*.*")])
         if filenames:
@@ -177,20 +393,22 @@ class GifTool(TkinterDnD.Tk):
                 parent=self,
             )
             return
-        first = valid[0]
         try:
-            with Image.open(first) as image:
-                image.seek(0)
-                oriented = ImageOps.exif_transpose(image).convert("RGB")
-                orientation = "pionowy" if oriented.height > oriented.width else "poziomy"
-                if oriented.height == oriented.width:
-                    orientation = "kwadratowy"
-                preview = ImageOps.contain(oriented, (360, 250), Image.Resampling.LANCZOS)
-            self.preview_photo = ImageTk.PhotoImage(preview)
-            self.preview.configure(image=self.preview_photo, text="")
             self.sources = valid
+            self.current_source_index = 0
+            retained = self.crop_boxes
+            self.crop_boxes = {}
+            for path in valid:
+                image = self.open_preview_image(path)
+                self.crop_boxes[path] = retained.get(path, self.default_crop_box(image.size))
+            self.load_current_preview()
+            assert self.preview_source_image is not None
+            oriented = self.preview_source_image
+            orientation = "pionowy" if oriented.height > oriented.width else "poziomy"
+            if oriented.height == oriented.width:
+                orientation = "kwadratowy"
             if len(valid) == 1:
-                label = first.name
+                label = valid[0].name
             else:
                 examples = ", ".join(path.name for path in valid[:3])
                 if len(valid) > 3:
@@ -219,6 +437,9 @@ class GifTool(TkinterDnD.Tk):
         style_name = self.style_var.get()
         palette_name = self.palette_var.get()
         compression_name = self.compression_var.get()
+        tags = [value for value in re.split(r"[\s,;]+", self.tags_var.get()) if value]
+        output_subfolder = metadata_token(self.folder_var.get()) or None
+        crop_boxes = {source: self.crop_boxes[source] for source in sources}
         self.status.configure(text=f"Przetwarzanie plików: {len(sources)}…", fg=MUTED)
 
         def work() -> None:
@@ -230,6 +451,9 @@ class GifTool(TkinterDnD.Tk):
                     style_name,
                     palette_name,
                     compression_name,
+                    tags,
+                    output_subfolder,
+                    crop_boxes,
                 )
                 self.after(0, lambda: self._conversion_done(result))
             except Exception as error:
@@ -248,7 +472,10 @@ class GifTool(TkinterDnD.Tk):
     def _conversion_done(self, batch: BatchConversionResult) -> None:
         self._set_busy(False)
         for result in batch.results:
-            shutil.copy2(result.output, self.send_dir / result.output.name)
+            relative = result.output.relative_to(self.output_dir / OUTPUT_FOLDER_NAME)
+            destination = self.send_dir / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(result.output, destination)
         success_count = len(batch.results)
         failure_count = len(batch.failures)
         self.status.configure(
@@ -283,7 +510,7 @@ class GifTool(TkinterDnD.Tk):
 
     def send_to_frame(self) -> None:
         files = [
-            path for path in self.send_dir.iterdir()
+            path for path in self.send_dir.rglob("*.gif")
             if path.is_file() and path.suffix.lower() == ".gif"
         ]
         if not files:
