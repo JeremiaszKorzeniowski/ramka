@@ -1,7 +1,8 @@
 # Ramka — ESP8266 + ST7735
 
 ESP8266 odtwarza obrazy i animacje GIF zapisane na karcie microSD. Ekran pracuje
-poziomo w rozdzielczości 160×128, a plik zmienia się co 12 sekund.
+poziomo w rozdzielczości 160×128, a plik zmienia się co 12 sekund. Wbudowany
+panel WWW umożliwia wgrywanie, pobieranie i usuwanie GIF-ów bez wyjmowania karty.
 
 Do katalogu głównego karty skopiuj pliki przygotowane w folderze `gif`:
 
@@ -61,8 +62,39 @@ wymagać zewnętrznego rezystora podciągającego 10 kΩ do 3,3 V.
 2. Włóż kartę microSD sformatowaną jako FAT32 (na początek najlepiej 4–32 GB).
 3. W Arduino IDE wybierz `NodeMCU 1.0 (ESP-12E Module)` i właściwy port COM.
 4. Zainstaluj biblioteki `Adafruit GFX Library`, `Adafruit ST7735 and ST7789
-   Library` oraz `AnimatedGIF` autorstwa Larry Bank.
+   Library`, `AnimatedGIF` autorstwa Larry Bank oraz `WiFiManager` autorstwa
+   tzapu.
 5. Zbuduj i wgraj szkic.
+
+## Pierwsze połączenie z Wi-Fi
+
+1. Po uruchomieniu ramka próbuje połączyć się z ostatnio zapisaną siecią.
+2. Przy pierwszym uruchomieniu tworzy punkt dostępowy `RAMKA-SETUP` z hasłem
+   `ramka123`.
+3. Połącz telefon lub komputer z tą siecią. Portal konfiguracji powinien otworzyć
+   się automatycznie; jeśli nie, wejdź na `http://192.168.4.1`.
+4. Wybierz domową sieć Wi-Fi i wpisz jej hasło.
+5. Po połączeniu otwórz `http://ramka.local`. Jeśli nazwa lokalna nie działa,
+   użyj adresu IP pokazanego na ekranie lub w Monitorze portu szeregowego.
+
+Portal konfiguracyjny czeka trzy minuty. Po przekroczeniu tego czasu urządzenie
+przechodzi w tryb offline i nadal wyświetla pliki z karty; reset uruchamia kolejną
+próbę połączenia.
+
+## Panel WWW
+
+Panel `ramka.local` pozwala:
+
+- zobaczyć wszystkie pliki `.gif` w katalogu głównym karty;
+- wgrać GIF z komputera lub telefonu;
+- pobrać GIF z bezpośredniego adresu `http://` albo `https://`;
+- usunąć wybrany plik;
+- skasować zapisane dane Wi-Fi i ponownie uruchomić konfigurację.
+
+Nazwy plików mogą zawierać litery ASCII, cyfry, kropkę, myślnik i podkreślenie.
+Pobierany plik może mieć maksymalnie 6 MB, a sam obraz nie może przekraczać
+160×128 pikseli. Panel nie ma logowania, dlatego powinien działać wyłącznie w
+zaufanej sieci domowej.
 
 ## Gdy ekran wygląda źle
 
@@ -74,7 +106,7 @@ wymagać zewnętrznego rezystora podciągającego 10 kΩ do 3,3 V.
 
 ## Pliki
 
-Lista nazw znajduje się w tablicy `ANIMATIONS` w `ramka.ino`. Użyte obrazy są
-plikami dostarczonymi przez użytkownika; przed publicznym udostępnieniem projektu
-warto sprawdzić ich źródła i licencje.
+Program automatycznie wykrywa do 32 plików `.gif` w katalogu głównym karty i
+sortuje je alfabetycznie. Użyte obrazy są plikami dostarczonymi przez użytkownika;
+przed publicznym udostępnieniem projektu warto sprawdzić ich źródła i licencje.
 
